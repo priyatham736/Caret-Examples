@@ -1,0 +1,253 @@
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+```
+
+Data mining in R - an example walkthrough using *Caret*
+========================================================
+
+R offers algorithms for data mining in several packages.
+
+*< Insert here some references>*
+
+
+One difficulty with these packages and functions is the fact that they all use slightly different syntax. The ```caret```-package offers a unified interface to different data mining functions.
+
+This write-up is not intended as documentation or vignette for the ```caret```-package (visit the website http://topepo.github.io/caret/index.html), it shall just serve the purpose of a simple introduction in R's data mining capabilities using this unified interface. 
+
+For this example, we will be using a dataset on artificial customer churn data. It is built into the R-package ```C50``` already.
+
+## The churn dataset
+
+From the description in R: (use ```?C50```)
+```{r load_data}
+library(C50)
+data(churn)
+?churnTrain
+colnames(churnTrain)
+```
+
+The datasource describes as follows:
+*The second case study uses data from the data archive at MLC++ that concerns telecommunications churn. These data are artificial but are claimed to be "based on claims similar to real world." Each case is described by 16 numeric and three nominal attributes and the data are divided into a training set of 3,333 cases and a separate test set containing 1,667 cases.*
+
+
+```{r glimpse, echo=TRUE}
+#head(churnTrain)
+#summary(churnTrain)
+```
+
+The dataset comes as ```churnTrain``` and ```churnTest``; the training set contains 3333 observations, the test set 1667. The outcome (whether customer churned or not) is in the last column  *churn*.
+Among explanatory variables we find information about the state, account length, area code, amount of calls etc.
+
+## Graphical exploration
+
+Our goal is to predict the **churn** from the other information provided. But before using algorithms we will visualize parts of the data in order to get a feel for possible patterns and relations (well, let's say we pick the two variables we use in the plot just randomly...).
+
+```{r plot, fig.cap="Minutes called vs customer service calls", echo=TRUE, fig.width=6, fig.height=4}
+library(ggplot2)
+ggplot(data=churnTrain, aes(x=total_day_minutes, y=number_customer_service_calls)) + geom_point(aes(color=churn), position="jitter", alpha=0.5) + facet_wrap(~churn) + theme_bw()
+```
+
+We observe that in case of a lot of minutes spent on the phones the churn rate seems higher. The same holds true if a lot of customer calls had been taken.
+
+Let's now apply some data mining algorithms.
+
+## Preparing the data
+
+For our prediction, went to split the data into a training set and a test set. Reason for this is to avoid any overfitting of the data by the model.
+
+Luckiliy the data set already is "split"; we have two data sets, i.e. ```churnTrain``` and ```churnTest```.
+
+However, we might incur a situation where some of the explanatory variables correlate. If we use methods like Trees, this is not a problem since the method itself discards "redundant" variables. For illustration purposes we nevertheless investigate the data for so-called multicollinearity.
+We first use a function from the ```caret```-package called ```findCorrelation```. We remove those variables from the dataset and run a PCA to investiagte for further linear combinations.
+
+```{r investigate}
+library(caret)
+index <- which(!sapply(churnTrain, is.numeric))
+churn.nums <- churnTrain[,-index]
+churn.corr <- cor(churn.nums)
+(index <- findCorrelation(churn.corr, verbose=FALSE))
+colnames(churn.nums[,index])
+
+churn.nums.clean <- churn.nums[,-index]
+
+churn.pca <- princomp(churn.nums.clean, cor= TRUE)
+summary(churn.pca)
+loadings(churn.pca)
+plot(churn.pca, type="l")
+# par(mfrow=c(1,2))
+# biplot(churn.pca, cex=c(.5,.75), col=c(0,2))
+# biplot(churn.pca, choices=2:3, cex=c(.5,.75), col=c(0,2))
+# par(mfrow=c(1,1))
+```
+
+The algorithm first suggests to remove those variables: `r colnames(churn.nums[,index])`.  
+
+These are mainly the _charges_: The dataset also contains _minutes_ and charges and minutes seem to scale linearily.
+Also, we observe from the PCA on the remaining dataset that the _number of customer calls_ is positive on the 2nd component, while _account length_, _daily calls_, _international minutes_ scale positively on the 1st coponent. However, given that we already removed correlated variables, the screeplot shows that only with 10 out of 11 components 90% of variance can be explained - so there is low opportunity to reduce dimensionality.
+
+For the remainder of the analysis we will continue using the complete dataset as we will employ techniques that perform feature selection as part of their algorithm, e.g trees. 
+
+## Building a tree
+
+We can use the function ```train``` from the ```caret-```package with the ```method="rpart"```. The ```rpart``` package provides *Breiman et al.'s* CART-algorithm. We could also just use the ```rpart```-package, but the purpose here is to show the capabilities of a unified interface with the ```caret```-package.
+
+```{r CART, echo=TRUE, warning=FALSE ,message=FALSE, fig.width=7, fig.height=6, fig.cap="CART tree on the Churn dataset"}
+set.seed(123)
+tree_cart <- train(churn~., data=churnTrain, method="rpart") # that creates the tree
+library(partykit) # we need this package to make the nice plot one line below
+plot(as.party(tree_cart$finalModel), tp_args=list(beside=TRUE), gp=gpar(cex=0.7, las=0))
+```
+
+The object ```tree_cart``` is created, and a ```rpart```-tree is fitted to it, using the training-data. ```rpart``` by default grows a full tree; the user quite likely will have to prune it afterwards. The implementation in ```caret``` however uses automatical bootstrapping for pruning on accuracy as metric.
+The ```partykit```-package is used to make a nice plot.
+We can observe that - on the training set - the classes (churn/not churn) are reasonably well predicted; and customers have high likelihood to churn, if they consume a lot of daily minutes and have no voice mail plan. 
+
+The ```caret```-package allows us to control some of the parameters. For example, the default is to use bootstrapping as a resampling scheme in the ```rpart```-function. We can change that and use 10-fold cross-validation on the training set by creating a kind of "parameter object" and pass that to the ```train```-function. Also we would like to use the value under the ROC curve as performance metric, that's why we tell ```train``` to use class probabilities (instead of merely predicting the class binary) (```classProbs=TRUE```) and we add the ```twoClassSummary```to include the ROC value. 
+
+
+```{r CART_cv, echo=TRUE, warning=FALSE, message=FALSE}
+cvCtrl <- trainControl(method="cv", number=10, classProbs=TRUE, summaryFunction=twoClassSummary)
+set.seed(123)
+tree_cart_cv <- train(churn~., data=churnTrain, method="rpart", trControl=cvCtrl, metric="ROC") # that creates the tree
+#tree_cart_cv
+#tree_cart_cv$finalModel
+plot(as.party(tree_cart_cv$finalModel), tp_args=list(beside=FALSE), gp=gpar(cex=0.7, las=0))
+
+# tree_rpart <- train(churn~., data=churnTrain, method="rpart", trControl=trainControl(method="none"), tuneLength=1) 
+# tree_rpart$finalModel
+#tree_rpart <- rpart(churn~., data=churnTrain, method="class")
+#plot(as.party(tree_rpart), tp_args=list(beside=FALSE), gp=gpar(cex=0.7, las=0))
+
+```
+
+(If you typed ```tree_cart``` you'd see that there Bootstrapping was the resampling method and accuracy was used to select the optimal model)
+
+The result is no different, though, in this case.
+
+The final model is a "sub-object" in ```tree_cart_cv```, you access it with the \$\-sign: ```tree_cart_cv$finalModel```.
+
+
+## Predict
+
+After our model has been set-up and trained, we can use it to make a prediction. And we start predicting on the training set, to see how well we did there. Of course it will only become interesting when we predict against the test set, but that later...
+
+```{r predict_cart, echo=TRUE, warning=FALSE, message=FALSE}
+predict_train <- predict(tree_cart_cv, churnTrain)
+confusionMatrix(predict_train, churnTrain$churn)
+# predict_train_rpart <- predict(tree_rpart, churnTrain, type="class") #predicts the unprunded rpart
+# confusionMatrix(predict_train_rpart, churnTrain$churn)
+```
+
+We first create an object that contains our prediction, using the model we just specified and using the training-data to predict on. We then create a confusion matrix (and a lot of other stuff...).
+Accuracy is about 0.88, kappa-statistic is about 0.3; the model seems to do fairly well.
+
+As next step we predict on the test data.
+
+```{r predict_cart2, echo=TRUE, warning=FALSE, message=FALSE}
+predict_test <- predict(tree_cart_cv, churnTest)
+confusionMatrix(predict_test, churnTest$churn)
+```
+
+The differences do not seem to be massive; normally one might expect worse performance on the out-of-sample set.
+
+What we are now interested in is getting the ROC curve, and mainly calculating the AUC-value. Therefore we have to predict class probabilities rather than the classes itself.
+
+
+```{r predict_probs}
+predict_probs <- predict(tree_cart_cv, churnTrain, type="prob")
+tail(predict_probs)
+```
+
+Looking the last six observations, we see the probabilities given to the three classes for one specific prediction.
+
+There are several packages that allow plotting of ROC curves; we will use ```ROCR```.
+(A sidenote here: Depending on the function you sue, it is important to the function what the positive and what the negative class is. If you end up with AUC<0.5, you quite likely have mixed up positive and negative classes)
+
+```{r roc, fig.width=7, fig.height=4, fig.cap="ROC curves for test data"}
+# library(pROC)
+# auc(churnTrain$churn, predict_probs$no)
+
+library(ROCR)
+preds_rocr <- prediction(predict_probs$yes, churnTrain$churn)
+auc <- round(performance(preds_rocr, "auc")@y.values[[1]],4)
+plot(performance(preds_rocr, "tpr", "fpr"), colorize=TRUE, main="ROC curve for class 'yes'")
+text(x=.4, y=0.4, labels=paste("AUC value: ",auc))
+
+```
+
+The AUC value confirms that the tree-model predicts better than random.
+
+
+## Compare multiple models
+
+Now we want to compare other models to the performance of our classification tree. We will choose the following:
+
+* the CART algorithm, as used previously
+* J48, as implemented in Weka
+* C5.0 tree (an evolution to Weka's J48 algorithm)
+* Support Vector machines
+* k-nearest-neighbours
+
+
+We train these models on the training data and present as measure of accuracy the ROC-value.
+
+```{r j48_c50}
+library(RWeka)
+# tree_j48 <- J48(churn~., data=churnTrain)
+# evaluate_Weka_classifier(tree_j48, numFolds = 10, complexity = FALSE, 
+#     seed = 1, class = TRUE)
+
+set.seed(123)
+tree_j48_cv <- train(churn~., data=churnTrain, method="J48", trControl=cvCtrl) # that creates the tree
+tree_j48_cv
+(tree_j48_cv$finalModel)
+predict_probs_j48 <- predict(tree_j48_cv, churnTrain, type="prob")
+
+## C5.0
+set.seed(123)
+tree_c5_cv <- train(churn~., data=churnTrain, method="C5.0Tree", trControl=cvCtrl) # that creates the tree
+#tree_c5_cv
+#summary(tree_c5_cv$finalModel)
+predict_probs_c5 <- predict(tree_c5_cv, churnTrain, type="prob")
+
+
+## SVM
+# library(kernlab)
+# set.seed(123)
+# #NOTE: Cannot get SVM running with caret for whatever reason....
+# #svmTune <- ksvm(Species~., data=train,prob.model=TRUE)
+# svmTune <- train(Species~., data=train, method="svmRadial", trControl=cvCtrl) # that creates the tree
+# predict_svm <- predict(svmTune, as.data.frame(test)[,-5], type="prob")
+# 
+# kNN
+knnFit <- train(churn~., data=churnTrain, method = "knn", trControl = cvCtrl)
+predict_knn <- predict(knnFit, churnTrain, type="prob")
+
+#compare different models
+#the problem seems to be how CARET treats factor variables. It blows the colums up, e.g. "stateAL"
+modelObjects <- list(cart=tree_cart_cv,
+                     j48=tree_j48_cv,
+                     c50=tree_c5_cv,
+                     knn=knnFit)
+#predict(modelObjects, churnTrain)
+
+#sapply(modelObjects, function(x) x$method)
+x <- data.frame(ROC=sort(sapply(modelObjects, function(x) max(x$results$ROC)), decreasing=TRUE))
+x
+```
+
+We observe that C50 and J48 perform similarly, while kNN and CART are significantly worse.
+
+We can also perform a resampling of the models to get a feeling for stability
+
+```{r resampling}
+# variances in resamples.
+cvValues <- resamples(list(CART=tree_cart_cv, C50=tree_c5_cv, J48=tree_j48_cv, kNN=knnFit))
+summary(cvValues)
+dotplot(cvValues)
+```
+
+We can observe that C50/J48 perform most stable in this case as well.
+
+So, what's missing? Clearly, we should now run the chosen algorithm against the testset to see how it performs there. This is left for later....
